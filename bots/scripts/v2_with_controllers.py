@@ -6,6 +6,22 @@ from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+
+
+def _paper_trade_trading_rules(self, connector_name, trading_pair):
+    connector = self.connectors[connector_name]
+    try:
+        return connector.trading_rules[trading_pair]
+    except AttributeError:
+        if connector_name.endswith("_paper_trade"):
+            # PaperTradeExchange has no trading_rules; use permissive paper rules.
+            return TradingRule(trading_pair)
+        raise
+
+
+ExecutorBase.get_trading_rules = _paper_trade_trading_rules
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
@@ -145,7 +161,7 @@ class V2WithControllers(StrategyV2Base):
             self.max_pnl_by_controller[controller_id] = Decimal("0")
             config_dict = controller.config.model_dump()
             if "connector_name" in config_dict:
-                if self.is_perpetual(config_dict["connector_name"]):
+                if self.is_perpetual(config_dict["connector_name"]) and not config_dict["connector_name"].endswith("_paper_trade"):
                     if "position_mode" in config_dict:
                         connectors_position_mode[config_dict["connector_name"]] = config_dict["position_mode"]
                     if "leverage" in config_dict and "trading_pair" in config_dict:
@@ -164,7 +180,7 @@ class V2WithControllers(StrategyV2Base):
             for controller_id, controller in self.controllers.items():
                 config_dict = controller.config.model_dump()
                 if "connector_name" in config_dict:
-                    if self.is_perpetual(config_dict["connector_name"]):
+                    if self.is_perpetual(config_dict["connector_name"]) and not config_dict["connector_name"].endswith("_paper_trade"):
                         if "position_mode" in config_dict:
                             connectors_position_mode[config_dict["connector_name"]] = config_dict["position_mode"]
             for connector_name, position_mode in connectors_position_mode.items():
