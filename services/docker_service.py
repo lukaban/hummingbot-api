@@ -247,6 +247,9 @@ class DockerService:
         conf_file_path = f"instances/{instance_name}/conf/conf_client.yml"
         client_config = fs_util.read_yaml_file(conf_file_path)
         client_config['instance_id'] = instance_name
+        mqtt_section = client_config.get('mqtt_bridge') or {}
+        mqtt_section['mqtt_host'] = 'emqx'
+        client_config['mqtt_bridge'] = mqtt_section
 
         # SEC-048: point the instance at the secured (mTLS) Gateway and give it the shared
         # cert set. Cert keys are decrypted inside the container with CONFIG_PASSWORD, so this
@@ -273,6 +276,16 @@ class DockerService:
         instance_logs = os.path.abspath(os.path.join(bots_path, instance_dir, 'logs'))
         shared_scripts = os.path.abspath(os.path.join(bots_path, "bots", 'scripts'))
         shared_controllers = os.path.abspath(os.path.join(bots_path, "bots", 'controllers'))
+        okx_override_dir = os.path.abspath(os.path.join(bots_path, "overrides"))
+        agent_token_source = None
+        try:
+            agent = self.client.containers.get("okx-agent-service")
+            agent_token_source = next(
+                mount['Source'] for mount in agent.attrs.get('Mounts', [])
+                if mount.get('Destination') == '/run/secrets/hummingbot_agent_token'
+            )
+        except (docker.errors.DockerException, StopIteration):
+            pass
 
         volumes = {
             instance_conf: {'bind': '/home/hummingbot/conf', 'mode': 'rw'},
@@ -283,18 +296,35 @@ class DockerService:
             instance_logs: {'bind': '/home/hummingbot/logs', 'mode': 'rw'},
             shared_scripts: {'bind': '/home/hummingbot/scripts', 'mode': 'rw'},
             shared_controllers: {'bind': '/home/hummingbot/controllers', 'mode': 'rw'},
+            os.path.join(okx_override_dir, 'okx_perpetual_derivative.py'): {
+                'bind': '/home/hummingbot/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_derivative.py',
+                'mode': 'ro',
+            },
+            os.path.join(okx_override_dir, 'okx_perpetual_utils.py'): {
+                'bind': '/home/hummingbot/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_utils.py',
+                'mode': 'ro',
+            },
         }
 
         # SEC-048: mount the shared mTLS certs read-only where hummingbot reads them
         # (root_path()/certs == /home/hummingbot/certs inside the instance container).
         if gateway_certs_host_dir:
             volumes[gateway_certs_host_dir] = {'bind': '/home/hummingbot/certs', 'mode': 'ro'}
+        if agent_token_source:
+            volumes[agent_token_source] = {'bind': '/run/secrets/hummingbot_agent_token', 'mode': 'ro'}
 
         # Set up environment variables
         environment = {}
+        # Docker Desktop may inject a host proxy into new containers. The OKX
+        # connector is more reliable over the container's direct network path.
+        environment["HTTP_PROXY"] = ""
+        environment["HTTPS_PROXY"] = ""
+        environment["NO_PROXY"] = "*"
         password = settings.security.config_password
         if password:
             environment["CONFIG_PASSWORD"] = password
+        if agent_token_source:
+            environment["HUMMINGBOT_AGENT_TOKEN_FILE"] = "/run/secrets/hummingbot_agent_token"
 
         if config.script_config:
             if password:
@@ -317,7 +347,7 @@ class DockerService:
                 name=instance_name,
                 volumes=volumes,
                 environment=environment,
-                network_mode="host",
+                network_mode="hummingbot-api_emqx-bridge",
                 detach=True,
                 tty=True,
                 stdin_open=True,

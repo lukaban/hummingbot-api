@@ -229,6 +229,12 @@ curl -u YOUR_USERNAME:YOUR_PASSWORD http://hummingbot-api:8000/health
 
 Full API documentation at http://localhost:8000/docs
 
+## OKX Demo runtime hardening in this fork
+
+The local OKX Demo deployment mounts `overrides/okx_perpetual_derivative.py` into each bot. The override keeps transient network failures tracked instead of treating them as missing orders, reconciles the size accepted by OKX before declaring an order filled, and sets isolated leverage for both `long` and `short` after reading the exchange position mode. Bot containers also clear inherited host proxy variables.
+
+The installed `mechanical_agent` Controller blocks new exposure as `orphaned_position` when an exchange position has no active Executor. This is a fail-closed detector, not automatic restart adoption: verify exchange positions plus regular and algo orders before restarting, and use full-size exchange-native `reduce-only` protection when a position must survive a bot restart.
+
 ## Development
 
 ```bash

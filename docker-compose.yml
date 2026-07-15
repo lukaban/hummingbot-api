@@ -2,10 +2,14 @@ services:
   hummingbot-api:
     container_name: hummingbot-api
     image: hummingbot/hummingbot-api:latest
+    restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./bots:/hummingbot-api/bots
+      - ./services/docker_service.py:/hummingbot-api/services/docker_service.py:ro
+      - ./overrides/okx_perpetual_derivative.py:/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_derivative.py:ro
+      - ./overrides/okx_perpetual_utils.py:/opt/conda/envs/hummingbot-api/lib/python3.12/site-packages/hummingbot/connector/derivative/okx_perpetual/okx_perpetual_utils.py:ro
       - /var/run/docker.sock:/var/run/docker.sock
       # Host metrics: mount the host's /proc read-only so the /system/resources
       # route reports HOST CPU/RAM/load instead of the container's.
@@ -57,13 +61,13 @@ services:
       - emqx-log:/opt/emqx/log
       - emqx-etc:/opt/emqx/etc
     ports:
-      - "1883:1883"  # mqtt:tcp
-      - "8883:8883"  # mqtt:tcp:ssl
-      - "8083:8083"  # mqtt:ws
-      - "8084:8084"  # mqtt:ws:ssl
-      - "8081:8081"  # http:management
-      - "18083:18083"  # http:dashboard
-      - "61613:61613"  # web-stomp gateway
+      - "127.0.0.1:1883:1883"  # mqtt:tcp
+      - "127.0.0.1:8883:8883"  # mqtt:tcp:ssl
+      - "127.0.0.1:8083:8083"  # mqtt:ws
+      - "127.0.0.1:8084:8084"  # mqtt:ws:ssl
+      - "127.0.0.1:8081:8081"  # http:management
+      - "127.0.0.1:18083:18083"  # http:dashboard
+      - "127.0.0.1:61613:61613"  # web-stomp gateway
     networks:
       emqx-bridge:
         aliases:
@@ -88,8 +92,6 @@ services:
       - postgres-data:/var/lib/postgresql/data
       # Init script as safety net - only runs on first initialization
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
-    ports:
-      - "5432:5432"
     networks:
       - emqx-bridge
     healthcheck:
