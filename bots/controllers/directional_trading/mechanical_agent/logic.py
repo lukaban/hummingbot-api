@@ -112,16 +112,13 @@ def parse_agent_result(
     raw_targets = payload.get("targets")
     if not isinstance(raw_targets, list) or not 1 <= len(raw_targets) <= 3:
         raise ValueError("targets must contain 1 to 3 items")
-    has_allocations = [target.get("allocation") is not None for target in raw_targets if isinstance(target, dict)]
-    if len(has_allocations) != len(raw_targets) or any(has_allocations) != all(has_allocations):
-        raise ValueError("allocations must be all present or all omitted")
-    if all(has_allocations):
-        allocations = [_decimal(target["allocation"], "allocation") for target in raw_targets]
-    else:
-        equal = Decimal(1) / Decimal(len(raw_targets))
-        allocations = [equal] * len(raw_targets)
-    if any(value <= 0 for value in allocations) or abs(sum(allocations) - Decimal(1)) > Decimal("0.000001"):
-        raise ValueError("target allocations must sum to one")
+    raw_targets = raw_targets[:2]
+    if not all(isinstance(target, dict) for target in raw_targets):
+        raise ValueError("invalid target")
+    allocations = (
+        [Decimal("1")] if len(raw_targets) == 1
+        else [Decimal("0.7"), Decimal("0.3")]
+    )
     risk = price - stop if decision == "long" else stop - price
     if risk <= 0:
         raise ValueError("stop is on the wrong side")

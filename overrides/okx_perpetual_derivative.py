@@ -150,11 +150,8 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         return is_time_synchronizer_related
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        # TODO: implement this method correctly for the connector
-        # The default implementation was added when the functionality to detect not found orders was introduced in the
-        # ExchangePyBase class. Also fix the unit test test_lost_order_removed_if_not_found_during_order_status_update
-        # when replacing the dummy implementation
-        return False
+        error_description = str(status_update_exception)
+        return '"code":"51603"' in error_description or "Order does not exist" in error_description
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         # TODO: implement this method correctly for the connector
@@ -162,6 +159,17 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         # ExchangePyBase class. Also fix the unit test test_cancel_order_not_found_in_the_exchange when replacing the
         # dummy implementation
         return False
+
+    async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
+        if isinstance(error, asyncio.CancelledError):
+            raise error
+        if self._is_order_not_found_during_status_update_error(error):
+            await self._order_tracker.process_order_not_found(order.client_order_id)
+            return
+        self.logger().warning(
+            f"Transient error fetching status for active order {order.client_order_id}; "
+            f"keeping it tracked for retry: {error}."
+        )
 
     async def _make_trading_pairs_request(self) -> Any:
         params = {"instType": "SWAP"}
@@ -502,7 +510,7 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         updated_order_data = await self._request_order_update(order=tracked_order)
 
         order_data = updated_order_data["data"][0]
-        new_state = CONSTANTS.ORDER_STATE[order_data["state"]]
+        new_state = self._normalized_order_state(order_data, tracked_order)
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
@@ -512,6 +520,21 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
             new_state=new_state,
         )
         return order_update
+
+    def _normalized_order_state(self, order_data: Dict[str, Any], tracked_order: InFlightOrder) -> OrderState:
+        order_state = CONSTANTS.ORDER_STATE[order_data["state"]]
+        if order_state != OrderState.FILLED or not order_data.get("sz"):
+            return order_state
+        requested_size = self._format_amount_to_size(tracked_order.trading_pair, tracked_order.amount)
+        accepted_size = Decimal(str(order_data["sz"]))
+        if accepted_size < requested_size:
+            self.logger().error(
+                f"Exchange accepted only {accepted_size} of {requested_size} contracts for "
+                f"{tracked_order.client_order_id}; treating the order as canceled after its fills "
+                "so the remaining amount can be replaced."
+            )
+            return OrderState.CANCELED
+        return order_state
 
     async def _request_order_update(self, order: InFlightOrder) -> Dict[str, Any]:
         return await self._api_request(
@@ -565,43 +588,26 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         """
         Calls REST API to get trade history (order fills)
         """
+        body_params = {"instType": "SWAP", "limit": 100}
+        if self._last_trade_history_timestamp:
+            body_params["begin"] = int(self._last_trade_history_timestamp * 1e3)
 
-        trade_history_tasks = []
-
-        for trading_pair in self._trading_pairs:
-            exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-            body_params = {
-                "instId": exchange_symbol,
-                "limit": 100,
-            }
-            if self._last_trade_history_timestamp:
-                body_params["begin"] = int(int(self._last_trade_history_timestamp) * 1e3)
-
-            trade_history_tasks.append(
-                asyncio.create_task(self._api_get(
-                    path_url=CONSTANTS.REST_USER_TRADE_RECORDS[CONSTANTS.ENDPOINT],
-                    params=body_params,
-                    is_auth_required=True,
-                    trading_pair=trading_pair,
-                ))
+        try:
+            response = await self._api_get(
+                path_url=CONSTANTS.REST_USER_TRADE_RECORDS[CONSTANTS.ENDPOINT],
+                params=body_params,
+                is_auth_required=True,
             )
-
-        raw_responses: List[Dict[str, Any]] = await safe_gather(*trade_history_tasks, return_exceptions=True)
-
-        # Initial parsing of responses. Joining all the responses
-        parsed_history_resps: List[Dict[str, Any]] = []
-        for trading_pair, resp in zip(self._trading_pairs, raw_responses):
-            if not isinstance(resp, Exception):
-                timestamps = [int(trade["ts"]) * 1e-3 for trade in resp["data"]]
-                self._last_trade_history_timestamp = max(timestamps) if timestamps else None
-                entries = resp["data"]
-                if entries:
-                    parsed_history_resps.extend(entries)
-            else:
-                self.logger().network(
-                    f"Error fetching status update for {trading_pair}: {resp}.",
-                    app_warning_msg=f"Failed to fetch status update for {trading_pair}."
-                )
+            parsed_history_resps = response["data"]
+            timestamps = [int(trade["ts"]) * 1e-3 for trade in parsed_history_resps]
+            if timestamps:
+                self._last_trade_history_timestamp = max(timestamps)
+        except Exception as error:
+            self.logger().network(
+                f"Error fetching trade history: {error}.",
+                app_warning_msg="Failed to fetch trade history.",
+            )
+            return
 
         # Trade updates must be handled before any order status updates.
         for trade in parsed_history_resps:
@@ -726,7 +732,12 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         :param order_msg: The order event message payload
         """
         client_order_id = order_msg["clOrdId"]
-        order_status = CONSTANTS.ORDER_STATE[order_msg["state"]]
+        updatable_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+        order_status = (
+            self._normalized_order_state(order_msg, updatable_order)
+            if updatable_order is not None
+            else CONSTANTS.ORDER_STATE[order_msg["state"]]
+        )
         trade_type = TradeType.BUY if order_msg["side"] == "buy" else TradeType.SELL
         position_side = PositionSide.LONG if order_msg["posSide"] == "long" else PositionSide.SHORT
         position_action = (PositionAction.OPEN
@@ -736,19 +747,9 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
         fill_fee_currency = order_msg.get("fillFeeCcy")
         fill_fee = -Decimal(order_msg.get("fillFee", "0"))
 
-        updatable_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-        if updatable_order is not None:
-            new_order_update: OrderUpdate = OrderUpdate(
-                trading_pair=updatable_order.trading_pair,
-                update_timestamp=self.current_timestamp,
-                new_state=order_status,
-                client_order_id=client_order_id,
-                exchange_order_id=order_msg["ordId"],
-            )
-            self._order_tracker.process_order_update(new_order_update)
-
         fillable_order = self._order_tracker.all_fillable_orders.get(client_order_id)
-        if fillable_order is not None and order_status in [OrderState.PARTIALLY_FILLED, OrderState.FILLED]:
+        exchange_order_status = CONSTANTS.ORDER_STATE[order_msg["state"]]
+        if fillable_order is not None and exchange_order_status in [OrderState.PARTIALLY_FILLED, OrderState.FILLED]:
             fill_base_amount = abs(self._format_size_to_amount(fillable_order.trading_pair, (Decimal(str(order_msg["fillSz"])))))
             fee = TradeFeeBase.new_perpetual_fee(
                 fee_schema=self.trade_fee_schema(),
@@ -768,6 +769,16 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
                 fill_timestamp=int(order_msg["uTime"]),
             )
             self._order_tracker.process_trade_update(trade_update)
+
+        if updatable_order is not None:
+            new_order_update: OrderUpdate = OrderUpdate(
+                trading_pair=updatable_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=order_status,
+                client_order_id=client_order_id,
+                exchange_order_id=order_msg["ordId"],
+            )
+            self._order_tracker.process_order_update(new_order_update)
 
     def _process_wallet_event_message(self, wallet_msg: Dict[str, Any]):
         """
@@ -824,28 +835,28 @@ class OkxPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        success = False
-        msg = ""
+        exchange_position_mode = await self._fetch_account_position_mode()
+        position_sides = ("long", "short") if exchange_position_mode == PositionMode.HEDGE else (None,)
+        errors = []
+        for position_side in position_sides:
+            data = {
+                "instId": exchange_symbol,
+                "lever": leverage,
+                "mgnMode": "isolated",
+            }
+            if position_side is not None:
+                data["posSide"] = position_side
+            resp: Dict[str, Any] = await self._api_post(
+                path_url=CONSTANTS.REST_SET_LEVERAGE[CONSTANTS.ENDPOINT],
+                data=data,
+                is_auth_required=True,
+                trading_pair=trading_pair,
+            )
+            if resp["code"] != CONSTANTS.RET_CODE_OK:
+                formatted_ret_code = self._format_ret_code_for_print(resp["code"])
+                errors.append(f"{position_side or 'net'}: {formatted_ret_code} - {resp['msg']}")
 
-        data = {
-            "instId": exchange_symbol,
-            "lever": leverage,
-            "mgnMode": "cross"
-        }
-        resp: Dict[str, Any] = await self._api_post(
-            path_url=CONSTANTS.REST_SET_LEVERAGE[CONSTANTS.ENDPOINT],
-            data=data,
-            is_auth_required=True,
-            trading_pair=trading_pair,
-        )
-
-        if resp["code"] == CONSTANTS.RET_CODE_OK:
-            success = True
-        else:
-            formatted_ret_code = self._format_ret_code_for_print(resp['code'])
-            msg = f"{formatted_ret_code} - {resp['msg']}"
-
-        return success, msg
+        return not errors, "; ".join(errors)
 
     async def trading_pair_associated_to_exchange_symbol(self, symbol: str):
         return symbol.rstrip("-SWAP")

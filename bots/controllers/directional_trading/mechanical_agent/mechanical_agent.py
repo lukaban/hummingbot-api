@@ -35,6 +35,13 @@ from .logic import (
 )
 
 
+FAMILY_TIME_LIMIT_SECONDS = {
+    "momentum_probe": 2700,
+    "standard_pullback": 5400,
+    "breakout_retest": 7200,
+}
+
+
 class MechanicalAgentControllerConfig(DirectionalTradingControllerConfigBase):
     controller_name: str = "mechanical_agent"
     strategy_version: str = "liquidity_profile_v2"
@@ -137,6 +144,8 @@ class MechanicalAgentController(DirectionalTradingControllerBase):
             "armed_trigger_type": self.processed_data.get("armed_trigger_type"),
             "armed_location_id": self.processed_data.get("armed_location_id"),
             "armed_invalidation_level": self.processed_data.get("armed_invalidation_level"),
+            "exchange_position_amount": self.processed_data.get("exchange_position_amount", "0"),
+            "orphan_position": self.processed_data.get("orphan_position", False),
         }
 
     def _set_state(self, state: str, now: float, **changes: Any) -> None:
@@ -158,7 +167,20 @@ class MechanicalAgentController(DirectionalTradingControllerBase):
     def _setup_id(self, event_id: str) -> str:
         return self._event_setup_ids.get(event_id, event_id)
 
-    def _sync_executor_lifecycle(self, now: float) -> None:
+    def _exchange_position_amount(self) -> Decimal:
+        connectors = getattr(self.market_data_provider, "connectors", {})
+        connector = connectors.get(self.config.connector_name) if connectors else None
+        positions = getattr(connector, "account_positions", {}) if connector is not None else {}
+        return sum(
+            (
+                abs(Decimal(str(position.amount)))
+                for position in positions.values()
+                if getattr(position, "trading_pair", None) == self.config.trading_pair
+            ),
+            Decimal(0),
+        )
+
+    def _sync_executor_lifecycle(self, now: float, exchange_position_amount: Decimal = Decimal(0)) -> None:
         groups: dict[str, list[Any]] = {}
         for executor in getattr(self, "executors_info", []):
             level_id = str(getattr(getattr(executor, "config", None), "level_id", "") or "")
@@ -170,7 +192,7 @@ class MechanicalAgentController(DirectionalTradingControllerBase):
                 continue
             if any(Decimal(str(getattr(executor, "filled_amount_quote", 0))) > 0 for executor in group):
                 self._journal.record(setup_id, "filled", now, execution_event_id=execution_event_id)
-            if all(bool(getattr(executor, "is_done", False)) for executor in group):
+            if all(bool(getattr(executor, "is_done", False)) for executor in group) and exchange_position_amount == 0:
                 pnl = sum((Decimal(str(getattr(executor, "net_pnl_quote", 0))) for executor in group), Decimal(0))
                 close_types = sorted({str(getattr(executor, "close_type", "unknown")) for executor in group})
                 self._journal.record(
@@ -192,7 +214,23 @@ class MechanicalAgentController(DirectionalTradingControllerBase):
         self.processed_data["signal"] = 0
         try:
             now = self.market_data_provider.time()
-            self._sync_executor_lifecycle(now)
+            exchange_position_amount = self._exchange_position_amount()
+            self.processed_data["exchange_position_amount"] = str(exchange_position_amount)
+            active_executor_exists = any(bool(getattr(executor, "is_active", False)) for executor in self.executors_info)
+            orphan_position = exchange_position_amount > 0 and not active_executor_exists
+            self.processed_data["orphan_position"] = orphan_position
+            self._sync_executor_lifecycle(now, exchange_position_amount)
+            if orphan_position:
+                self.processed_data["risk_status"] = {
+                    "gate": "blocked",
+                    "reason": "exchange_position_without_active_executor",
+                    "exchange_position_amount": str(exchange_position_amount),
+                }
+                self._set_state(
+                    "orphaned_position", now,
+                    last_rejection_reason="exchange_position_without_active_executor",
+                )
+                return
             _, risk_status = evaluate_execution_risk(
                 self.executors_info, now, Decimal(0),
                 max_daily_loss_quote=self.config.max_daily_loss_quote,
@@ -428,7 +466,7 @@ class MechanicalAgentController(DirectionalTradingControllerBase):
             barrier = TripleBarrierConfig(
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                time_limit=self.config.time_limit,
+                time_limit=FAMILY_TIME_LIMIT_SECONDS[plan.execution_family],
                 trailing_stop=self.config.trailing_stop,
                 open_order_type=OrderType.MARKET,
                 take_profit_order_type=OrderType.LIMIT,

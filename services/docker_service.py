@@ -315,6 +315,11 @@ class DockerService:
 
         # Set up environment variables
         environment = {}
+        # Docker Desktop may inject a host proxy into new containers. The OKX
+        # connector is more reliable over the container's direct network path.
+        environment["HTTP_PROXY"] = ""
+        environment["HTTPS_PROXY"] = ""
+        environment["NO_PROXY"] = "*"
         password = settings.security.config_password
         if password:
             environment["CONFIG_PASSWORD"] = password
